@@ -36,6 +36,8 @@
 #include "handle-inl.h"
 #include "fs-fd-hash-inl.h"
 
+#pragma comment(lib, "shlwapi.lib")
+
 
 #define UV_FS_FREE_PATHS         0x0002
 #define UV_FS_FREE_PTR           0x0008
@@ -444,6 +446,110 @@ INLINE static int fs__readlink_handle(HANDLE handle, char** target_ptr,
   }
 
   return fs__wide_to_utf8(w_target, w_target_len, target_ptr, target_len_ptr);
+}
+
+INLINE static WCHAR* fs__wcsdup(WCHAR* pathw) {
+  size_t len = wcslen(pathw);
+  WCHAR* out;
+
+  out = (WCHAR*)uv__malloc((len + 1) * sizeof(WCHAR));
+  if (out == NULL) {
+    return NULL;
+  }
+
+  wcscpy(out, pathw);
+
+  return out;
+}
+
+INLINE static int fs__get_readlink(WCHAR* path, WCHAR** out) {
+  HANDLE handle;
+  size_t len;
+  DWORD ret;
+  char* reallink_utf8 = NULL;
+  WCHAR* reallink_wchar = NULL;
+  WCHAR *path_dir, *path_absolute, *path_temp;
+
+  handle =
+      CreateFileW(path,
+                  FILE_READ_ATTRIBUTES,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  NULL,
+                  OPEN_EXISTING,
+                  FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                  NULL);
+
+  if (handle == INVALID_HANDLE_VALUE) {
+    return -1;
+  }
+
+  ret = fs__readlink_handle(handle, &reallink_utf8, NULL);
+
+  CloseHandle(handle);
+
+  if (ret != 0) {
+    uv__free(reallink_utf8);
+    return ret;
+  }
+
+  ret = uv__convert_utf8_to_utf16(reallink_utf8, -1, &reallink_wchar);
+  if (ret != 0) {
+    uv__free(reallink_utf8);
+    return ret;
+  }
+
+  uv__free(reallink_utf8);
+
+  if (PathIsRelativeW(reallink_wchar)) {
+    path_dir = fs__wcsdup(path);
+    if (path_dir == NULL) {
+      uv__free(reallink_wchar);
+      return ERROR_OUTOFMEMORY;
+    }
+
+    PathRemoveFileSpecW(path_dir);
+
+    len = wcslen(path_dir) + wcslen(reallink_wchar) + 2;
+    path_absolute = (WCHAR*)uv__malloc(len * sizeof(WCHAR));
+    wcscpy(path_absolute, path_dir);
+    wcscat(path_absolute, L"\\");
+    wcscat(path_absolute, reallink_wchar);
+
+    uv__free(reallink_wchar);
+
+    path_temp = fs__wcsdup(path_absolute);
+    if (path_temp == NULL) {
+      uv__free(path_temp);
+      uv__free(reallink_wchar);
+      return ERROR_OUTOFMEMORY;
+    }
+
+    PathCanonicalizeW(path_temp, path_absolute);
+
+    if (wcsncmp(path_dir, L"\\\\?\\", 4) == 0) {
+      wcscpy(path_absolute, L"\\\\?\\");
+      wcscat(path_absolute, path_temp);
+    }
+
+    uv__free(path_dir);
+    uv__free(path_temp);
+
+    *out = path_absolute;
+  }
+
+  return 0;
+}
+
+INLINE static void fs__get_readlink_revival(WCHAR* path, WCHAR** out) {
+  WCHAR *current, *next = NULL;
+
+  current = fs__wcsdup(path);
+  while (fs__get_readlink(current, &next) == 0) {
+    uv__free(current);
+    current = next;
+  }
+
+  *out = current;
 }
 
 
@@ -1357,6 +1463,8 @@ void fs__mkstemp(uv_fs_t* req) {
 void fs__scandir(uv_fs_t* req) {
   static const size_t dirents_initial_size = 32;
 
+  WCHAR* pathw, *path_real;
+
   HANDLE dir_handle = INVALID_HANDLE_VALUE;
 
   uv__dirent_t** dirents = NULL;
@@ -1381,15 +1489,23 @@ void fs__scandir(uv_fs_t* req) {
   STATIC_ASSERT(sizeof buffer >=
                 sizeof(FILE_DIRECTORY_INFORMATION) + 256 * sizeof(WCHAR));
 
+  pathw = req->file.pathw;
+
+  fs__get_readlink_revival(pathw, &path_real);
+  pathw = path_real;
+
   /* Open the directory. */
   dir_handle =
-      CreateFileW(req->file.pathw,
+      CreateFileW(pathw,
                   FILE_LIST_DIRECTORY | SYNCHRONIZE,
                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                   NULL,
                   OPEN_EXISTING,
                   FILE_FLAG_BACKUP_SEMANTICS,
                   NULL);
+
+  uv__free(pathw);
+
   if (dir_handle == INVALID_HANDLE_VALUE)
     goto win32_error;
 
@@ -1567,7 +1683,7 @@ cleanup:
 }
 
 void fs__opendir(uv_fs_t* req) {
-  WCHAR* pathw;
+  WCHAR *pathw, *path_real;
   size_t len;
   const WCHAR* fmt;
   WCHAR* find_path;
@@ -1576,6 +1692,9 @@ void fs__opendir(uv_fs_t* req) {
   pathw = req->file.pathw;
   dir = NULL;
   find_path = NULL;
+
+  fs__get_readlink_revival(pathw, &path_real);
+  pathw = path_real;
 
   /* Figure out whether path is a file or a directory. */
   if (!(GetFileAttributesW(pathw) & FILE_ATTRIBUTE_DIRECTORY)) {
@@ -1614,6 +1733,8 @@ void fs__opendir(uv_fs_t* req) {
     goto error;
   }
 
+  uv__free(pathw);
+
   dir->need_find_call = FALSE;
   req->ptr = dir;
   SET_REQ_RESULT(req, 0);
@@ -1622,6 +1743,7 @@ void fs__opendir(uv_fs_t* req) {
 error:
   uv__free(dir);
   uv__free(find_path);
+  uv__free(pathw);
   req->ptr = NULL;
 }
 
@@ -1856,6 +1978,7 @@ INLINE static DWORD fs__stat_impl_from_path(WCHAR* path,
   HANDLE handle;
   DWORD flags;
   DWORD ret;
+  WCHAR* path_real;
 
   flags = FILE_FLAG_BACKUP_SEMANTICS;
   if (do_lstat)
@@ -1877,6 +2000,15 @@ INLINE static DWORD fs__stat_impl_from_path(WCHAR* path,
     ret = 0;
 
   CloseHandle(handle);
+
+  if (!do_lstat && ret == ERROR_ACCESS_DENIED) {
+    fs__get_readlink_revival(path, &path_real);
+    if (wcscmp(path, path_real) != 0) {
+      ret = fs__stat_impl_from_path(path_real, 0, statbuf);
+      uv__free(path_real);
+    }
+  }
+
   return ret;
 }
 

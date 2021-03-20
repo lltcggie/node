@@ -47,6 +47,7 @@ typedef struct pollfd {
 #include <mswsock.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <shlwapi.h>
 
 #include <process.h>
 #include <signal.h>
